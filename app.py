@@ -97,10 +97,13 @@ Base.metadata.create_all(bind=engine)
 with st.sidebar:
     st.header("⚙️ Workspace")
 
-    gemini_api_key = st.text_input(
-        "Gemini API Key",
-        type="password"
-    )
+    try:
+        gemini_api_key = st.secrets["GEMINI_API_KEY"]
+        st.success("✅ AI Engine Connected")
+
+    except Exception:
+        gemini_api_key = None
+        st.error("❌ Gemini API Key Missing")
 
     st.info("Get your key from Google AI Studio.")
 
