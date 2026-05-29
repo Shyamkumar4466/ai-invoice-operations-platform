@@ -7,6 +7,7 @@ import docx
 import io
 import os
 import logging
+import time
 
 from google import genai
 from pydantic import BaseModel
@@ -14,6 +15,8 @@ from sklearn.ensemble import IsolationForest
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
+
+from enterprise_analytics_dashboard import render_enterprise_analytics_dashboard
 
 # =========================================================
 # PAGE CONFIG
@@ -84,6 +87,7 @@ class InvoiceRecord(Base):
     fraud_score = Column(Float)
 
     status = Column(String)
+    compliance_status = Column(String)
     risks = Column(Text)
 
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -173,37 +177,61 @@ def save_uploaded_file(uploaded_file):
 def extract_content_smart(uploaded_file):
     file_type = uploaded_file.name.split(".")[-1].lower()
 
-    # PDF
+    extracted_documents = []
+
+    # =====================================================
+    # PDF PROCESSING
+    # =====================================================
+
     if file_type == "pdf":
+
+        pdf_bytes = uploaded_file.read()
+
         doc = fitz.open(
-            stream=uploaded_file.read(),
+            stream=pdf_bytes,
             filetype="pdf"
         )
 
-        text = ""
+        # PROCESS EACH PAGE AS SEPARATE INVOICE
+        for page_number in range(len(doc)):
 
-        for page in doc:
-            text += page.get_text()
+            page = doc.load_page(page_number)
 
-        # scanned PDF detection
-        if len(text.strip()) < 100:
-            pix = doc[0].get_pixmap()
+            text = page.get_text()
 
-            img_data = pix.tobytes("png")
+            # ---------------------------------------------
+            # SCANNED PAGE DETECTION
+            # ---------------------------------------------
 
-            return {
-                "type": "image",
-                "data": img_data,
-                "mime_type": "image/png"
-            }
+            if len(text.strip()) < 50:
 
-        return {
-            "type": "text",
-            "data": text
-        }
+                pix = page.get_pixmap()
 
-    # DOCX
+                img_data = pix.tobytes("png")
+
+                extracted_documents.append({
+                    "type": "image",
+                    "data": img_data,
+                    "mime_type": "image/png",
+                    "page": page_number + 1
+                })
+
+            else:
+
+                extracted_documents.append({
+                    "type": "text",
+                    "data": text,
+                    "page": page_number + 1
+                })
+
+        return extracted_documents
+
+    # =====================================================
+    # DOCX PROCESSING
+    # =====================================================
+
     elif file_type in ["docx", "doc"]:
+
         document = docx.Document(uploaded_file)
 
         full_text = []
@@ -213,26 +241,37 @@ def extract_content_smart(uploaded_file):
 
         for table in document.tables:
             for row in table.rows:
+
                 row_text = " | ".join(
                     cell.text for cell in row.cells
                 )
 
                 full_text.append(row_text)
 
-        return {
+        extracted_documents.append({
             "type": "text",
-            "data": "\n".join(full_text)
-        }
+            "data": "\n".join(full_text),
+            "page": 1
+        })
 
-    # IMAGE
+        return extracted_documents
+
+    # =====================================================
+    # IMAGE PROCESSING
+    # =====================================================
+
     elif file_type in ["jpg", "jpeg", "png"]:
-        return {
+
+        extracted_documents.append({
             "type": "image",
             "data": uploaded_file.getvalue(),
-            "mime_type": f"image/{file_type}"
-        }
+            "mime_type": f"image/{file_type}",
+            "page": 1
+        })
 
-    return None
+        return extracted_documents
+
+    return []
 
 # =========================================================
 # AI EXTRACTION ENGINE
@@ -267,17 +306,28 @@ def process_invoice_agent(api_key, content_payload):
             "mime_type": content_payload["mime_type"]
         })
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": InvoiceSchema,
-            "temperature": 0.1
-        }
-    )
+    for attempt in range(3):
+        try:
 
-    return json.loads(response.text)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": InvoiceSchema,
+                    "temperature": 0.1
+                }
+            )
+
+            return json.loads(response.text)
+
+        except Exception as e:
+
+            if attempt < 2:
+                time.sleep(2)
+                continue
+
+            raise e
 
 # =========================================================
 # FRAUD ENGINE
@@ -322,7 +372,8 @@ class FraudDetector:
 def run_compliance_audit(
     data,
     fraud_history,
-    historical_totals
+    historical_totals,
+    existing_invoice_numbers
 ):
     flags = []
 
@@ -362,22 +413,24 @@ def run_compliance_audit(
             "Invoice total mismatch detected"
         )
 
-    # GST VALIDATION
-    if data["currency"] == "INR":
-        expected_tax = data["subtotal"] * 0.18
+    # DUPLICATE INVOICE CHECK
+    if data["invoice_number"] in existing_invoice_numbers:
+        flags.append(
+            "Duplicate invoice number detected"
+        )      
+    # GLOBAL TAX VALIDATION
 
-        if abs(expected_tax - data["vat_or_tax_amount"]) > 2:
+    if data["subtotal"] > 0 and data["vat_or_tax_amount"] > 0:
+
+        calculated_rate = (
+            data["vat_or_tax_amount"] /
+            data["subtotal"]
+        ) * 100
+
+        if calculated_rate > 35:
+
             flags.append(
-                "Potential GST compliance issue"
-            )
-
-    # VAT VALIDATION
-    elif data["currency"] == "GBP":
-        expected_tax = data["subtotal"] * 0.20
-
-        if abs(expected_tax - data["vat_or_tax_amount"]) > 2:
-            flags.append(
-                "Potential VAT compliance issue"
+                f"Unusually high tax rate ({round(calculated_rate, 2)}%)"
             )
 
     # BLACKLIST CHECK
@@ -398,9 +451,9 @@ def run_compliance_audit(
     # ML ANOMALY DETECTION
     detector = FraudDetector()
 
-    fraud_score = detector.anomaly_score(
-        historical_totals,
-        data["total_amount"]
+    fraud_score = min(
+        len(flags) * 0.25,
+        1.0
     )
 
     if fraud_score > 0.9:
@@ -409,11 +462,12 @@ def run_compliance_audit(
         )
 
     status = "✅ Verified"
+    compliance_status = "Compliant"
 
     if flags:
         status = "⚠️ Flagged"
-
-    return status, flags, fraud_score
+        compliance_status = "Non-Compliant"
+    return status, compliance_status, flags, fraud_score
 
 # =========================================================
 # SESSION STATE
@@ -477,77 +531,80 @@ with tab1:
                             save_uploaded_file(file)
 
                             # EXTRACT CONTENT
-                            payload = extract_content_smart(file)
+                            payloads = extract_content_smart(file)
 
-                            if not payload:
+                            if not payloads:
                                 continue
 
-                            # AI PROCESSING
-                            data = process_invoice_agent(
-                                gemini_api_key,
-                                payload
-                            )
+                            # PROCESS EACH PAGE SEPARATELY
+                            for payload in payloads:
 
-                            # AUDIT ENGINE
-                            status, risks, fraud_score = run_compliance_audit(
-                                data,
-                                st.session_state["fraud_history"],
-                                st.session_state["historical_totals"]
-                            )
+                                try:
+                                    data = process_invoice_agent(
+                                        gemini_api_key,
+                                        payload
+                                    )
 
-                            st.session_state[
-                                "historical_totals"
-                            ].append(
-                                data["total_amount"]
-                            )
+                                except Exception as e:
+                                    st.error(f"AI extraction failed: {e}")
+                                    continue
 
-                            # DATABASE SAVE
-                            record = InvoiceRecord(
-                                filename=file.name,
-                                vendor_name=data["vendor_name"],
-                                invoice_number=data["invoice_number"],
-                                invoice_date=data["invoice_date"],
-                                currency=data["currency"],
-                                subtotal=data["subtotal"],
-                                tax=data["vat_or_tax_amount"],
-                                total=data["total_amount"],
-                                confidence=data["confidence_score"],
-                                fraud_score=fraud_score,
-                                status=status,
-                                risks=", ".join(risks)
-                            )
+                                # AUDIT ENGINE
+                                existing_invoice_numbers = [
+                                    r.invoice_number
+                                    for r in session.query(
+                                        InvoiceRecord
+                                    ).all()
+                                ]
+                                status, compliance_status, risks, fraud_score = run_compliance_audit(
+                                    data,
+                                    st.session_state["fraud_history"],
+                                    st.session_state["historical_totals"],
+                                    existing_invoice_numbers
+                                )
 
-                            session.add(record)
+                                st.session_state[
+                                    "historical_totals"
+                                ].append(
+                                    data["total_amount"]
+                                )
 
-                            session.commit()
+                                # DATABASE SAVE
+                                record = InvoiceRecord(
+                                    filename=f"{file.name} | Page {payload['page']}",
+                                    vendor_name=data["vendor_name"],
+                                    invoice_number=data["invoice_number"],
+                                    invoice_date=data["invoice_date"],
+                                    currency=data["currency"],
+                                    subtotal=data["subtotal"],
+                                    tax=data["vat_or_tax_amount"],
+                                    total=data["total_amount"],
+                                    confidence=data["confidence_score"],
+                                    fraud_score=fraud_score,
+                                    status=status,
+                                    compliance_status=compliance_status,
+                                    risks=", ".join(risks)
+                                )
 
-                            # UI DATA
-                            batch_data.append({
-                                "Filename": file.name,
-                                "Vendor": data["vendor_name"],
-                                "Invoice #": data["invoice_number"],
-                                "Currency": data["currency"],
-                                "Total": data["total_amount"],
-                                "Fraud Score": round(fraud_score, 2),
-                                "Confidence": f"{data['confidence_score']*100:.0f}%",
-                                "Status": status,
-                                "Risks": ", ".join(risks)
-                            })
+                                session.add(record)
+                                session.commit()
+
+                                # UI DATA
+                                batch_data.append({
+                                    "Filename": f"{file.name} | Page {payload['page']}",
+                                    "Vendor": data["vendor_name"],
+                                    "Invoice #": data["invoice_number"],
+                                    "Currency": data["currency"],
+                                    "Total": data["total_amount"],
+                                    "Fraud Score": round(fraud_score, 2),
+                                    "Confidence": f"{data['confidence_score']*100:.0f}%",
+                                    "Status": status,
+                                    "Risks": ", ".join(risks)
+                                })
 
                         except Exception as e:
                             logging.error(str(e))
-
-                            batch_data.append({
-                                "Filename": file.name,
-                                "Vendor": "ERROR",
-                                "Invoice #": "FAILED",
-                                "Currency": "N/A",
-                                "Total": 0,
-                                "Fraud Score": 0,
-                                "Confidence": 0,
-                                "Status": "FAILED",
-                                "Risks": str(e)
-                            })
+                            continue
 
                         progress_bar.progress(
                             (idx + 1) / len(uploaded_files)
@@ -662,35 +719,43 @@ with tab1:
 # =========================================================
 
 with tab2:
-    st.subheader("📊 Vendor Analytics")
 
     session = SessionLocal()
 
-    records = session.query(
+    rows = session.query(
         InvoiceRecord
     ).all()
 
-    analytics_data = []
+    analytics_records = []
 
-    for row in records:
-        analytics_data.append({
-            "Vendor": row.vendor_name,
-            "Total": row.total,
-            "Fraud Score": row.fraud_score,
-            "Status": row.status
+    for row in rows:
+        analytics_records.append({
+            "vendor_name": row.vendor_name,
+            "invoice_number": row.invoice_number,
+            "invoice_date": row.invoice_date,
+            "currency": row.currency,
+            "total_amount": row.total,
+            "fraud_score": row.fraud_score * 100,
+            "status": row.status,
+            "compliance_status": row.compliance_status
         })
 
-    if analytics_data:
-        analytics_df = pd.DataFrame(
-            analytics_data
+    analytics_df = pd.DataFrame(
+        analytics_records
+    )
+
+    if not analytics_df.empty:
+        render_enterprise_analytics_dashboard(
+            analytics_df,
+            gemini_model=None
         )
 
         # BAR CHART
         fig = px.bar(
             analytics_df,
-            x="Vendor",
-            y="Total",
-            color="Status",
+            x="vendor_name",
+            y="total_amount",
+            color="status",
             title="Vendor Spend Analytics"
         )
 
@@ -702,7 +767,7 @@ with tab2:
         # FRAUD HISTOGRAM
         fig2 = px.histogram(
             analytics_df,
-            x="Fraud Score",
+            x="fraud_score",
             nbins=10,
             title="Fraud Score Distribution"
         )
@@ -711,7 +776,6 @@ with tab2:
             fig2,
             use_container_width=True
         )
-
     else:
         st.info(
             "Upload invoices to start generating compliance analytics."
