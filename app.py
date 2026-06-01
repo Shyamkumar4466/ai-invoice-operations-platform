@@ -70,6 +70,17 @@ Base = declarative_base()
 # DATABASE MODEL
 # =========================================================
 
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    name = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    users = relationship("User", back_populates="organization")
+
 class InvoiceRecord(Base):
     __tablename__ = "invoice_records"
 
@@ -110,12 +121,20 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
 
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id"),
+        nullable=True,
+        index=True
+    )
+
     name = Column(String, nullable=False)
     email = Column(String, nullable=False, unique=True, index=True)
     password_hash = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    organization = relationship("Organization", back_populates="users")
     invoices = relationship("InvoiceRecord", back_populates="owner")
 
 class AuditLog(Base):
@@ -182,10 +201,17 @@ def create_user(name, email, password_hash):
     session = SessionLocal()
 
     try:
+        normalized_name = name.strip()
+
+        organization = Organization(
+            name=f"{normalized_name}'s Organization"
+        )
+
         user = User(
-            name=name.strip(),
+            name=normalized_name,
             email=email.strip().lower(),
-            password_hash=password_hash
+            password_hash=password_hash,
+            organization=organization
         )
 
         session.add(user)
@@ -363,6 +389,33 @@ for owner_scoped_table in (
     "notifications"
 ):
     add_nullable_user_id_column(owner_scoped_table)
+
+def add_nullable_organization_id_column():
+    database_inspector = inspect(engine)
+    column_names = {
+        column["name"]
+        for column in database_inspector.get_columns("users")
+    }
+
+    if "organization_id" not in column_names:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN organization_id INTEGER "
+                    "REFERENCES organizations(id)"
+                )
+            )
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_users_organization_id "
+                "ON users (organization_id)"
+            )
+        )
+
+add_nullable_organization_id_column()
 
 initialize_auth_session()
 
