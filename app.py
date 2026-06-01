@@ -7,6 +7,7 @@ import docx
 import io
 import os
 import logging
+import re
 import time
 
 from google import genai
@@ -94,6 +95,17 @@ class InvoiceRecord(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False, unique=True, index=True)
+    password_hash = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
@@ -125,6 +137,67 @@ class NotificationRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     is_read = Column(Boolean, default=False)
+
+_BCRYPT_HASH_PATTERN = re.compile(
+    r"\A\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}\Z"
+)
+
+def create_user(name, email, password_hash):
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Name must not be empty.")
+
+    if not isinstance(email, str) or not email.strip():
+        raise ValueError("Email must not be empty.")
+
+    if (
+        not isinstance(password_hash, str)
+        or not _BCRYPT_HASH_PATTERN.fullmatch(password_hash)
+    ):
+        raise ValueError("A valid bcrypt password hash is required.")
+
+    session = SessionLocal()
+
+    try:
+        user = User(
+            name=name.strip(),
+            email=email.strip().lower(),
+            password_hash=password_hash
+        )
+
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        session.expunge(user)
+
+        return user
+
+    except Exception:
+        session.rollback()
+        raise
+
+    finally:
+        session.close()
+
+def get_user_by_email(email):
+    if not isinstance(email, str) or not email.strip():
+        return None
+
+    session = SessionLocal()
+
+    try:
+        user = (
+            session.query(User)
+            .filter(User.email == email.strip().lower())
+            .first()
+        )
+
+        if user:
+            session.expunge(user)
+
+        return user
+
+    finally:
+        session.close()
 
 def create_notification(
     session,
