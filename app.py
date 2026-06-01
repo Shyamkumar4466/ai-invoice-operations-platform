@@ -235,6 +235,12 @@ def initialize_auth_session():
         if key not in st.session_state:
             st.session_state[key] = default_value
 
+def logout_user():
+    st.session_state.authenticated = False
+    st.session_state.user_id = None
+    st.session_state.user_email = None
+    st.session_state.user_name = None
+
 def render_login_section():
     st.subheader("Login")
 
@@ -369,6 +375,14 @@ if not st.session_state.authenticated:
 # =========================================================
 
 with st.sidebar:
+    st.write(f"Welcome, {st.session_state.user_name}")
+
+    if st.button("Logout"):
+        logout_user()
+        st.rerun()
+
+    st.divider()
+
     st.header("⚙️ Workspace")
 
     try:
