@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
-from auth import hash_password
+from auth import hash_password, verify_password
 from enterprise_analytics_dashboard import render_enterprise_analytics_dashboard
 
 # =========================================================
@@ -201,9 +201,43 @@ def get_user_by_email(email):
     finally:
         session.close()
 
-def render_signup_section():
-    st.subheader("Authentication")
+def initialize_auth_session():
+    auth_defaults = {
+        "authenticated": False,
+        "user_id": None,
+        "user_email": None,
+        "user_name": None
+    }
 
+    for key, default_value in auth_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+
+def render_login_section():
+    st.subheader("Login")
+
+    with st.form("login_form"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        login_submitted = st.form_submit_button("Login")
+
+    if not login_submitted:
+        return
+
+    user = get_user_by_email(email)
+
+    if not user or not verify_password(password, user.password_hash):
+        st.error("Invalid email or password")
+        return
+
+    st.session_state.authenticated = True
+    st.session_state.user_id = user.id
+    st.session_state.user_email = user.email
+    st.session_state.user_name = user.name
+
+    st.rerun()
+
+def render_signup_section():
     with st.expander("Create Account"):
         with st.form("signup_form", clear_on_submit=True):
             name = st.text_input("Name")
@@ -242,6 +276,17 @@ def render_signup_section():
             else:
                 st.success("Account created successfully. Please login.")
 
+def render_authentication_screen():
+    st.subheader("Authentication")
+
+    login_column, signup_column = st.columns(2)
+
+    with login_column:
+        render_login_section()
+
+    with signup_column:
+        render_signup_section()
+
 def create_notification(
     session,
     message,
@@ -258,15 +303,17 @@ def create_notification(
 
 Base.metadata.create_all(bind=engine)
 
+initialize_auth_session()
+
+if not st.session_state.authenticated:
+    render_authentication_screen()
+    st.stop()
+
 # =========================================================
 # SIDEBAR
 # =========================================================
 
 with st.sidebar:
-    render_signup_section()
-
-    st.divider()
-
     st.header("⚙️ Workspace")
 
     try:
