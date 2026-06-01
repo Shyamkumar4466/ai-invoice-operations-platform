@@ -14,9 +14,11 @@ from google import genai
 from pydantic import BaseModel
 from sklearn.ensemble import IsolationForest
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, Boolean
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
+from auth import hash_password
 from enterprise_analytics_dashboard import render_enterprise_analytics_dashboard
 
 # =========================================================
@@ -199,6 +201,47 @@ def get_user_by_email(email):
     finally:
         session.close()
 
+def render_signup_section():
+    st.subheader("Authentication")
+
+    with st.expander("Create Account"):
+        with st.form("signup_form", clear_on_submit=True):
+            name = st.text_input("Name")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            confirm_password = st.text_input(
+                "Confirm Password",
+                type="password"
+            )
+            signup_submitted = st.form_submit_button("Sign Up")
+
+        if not signup_submitted:
+            return
+
+        if not name.strip():
+            st.error("Name cannot be empty.")
+        elif not email.strip():
+            st.error("Email cannot be empty.")
+        elif not password:
+            st.error("Password cannot be empty.")
+        elif password != confirm_password:
+            st.error("Passwords do not match.")
+        elif get_user_by_email(email):
+            st.error("An account with this email already exists.")
+        else:
+            try:
+                hashed_password = hash_password(password)
+                create_user(name, email, hashed_password)
+            except IntegrityError:
+                st.error("An account with this email already exists.")
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception:
+                logging.exception("User signup failed.")
+                st.error("Unable to create account. Please try again.")
+            else:
+                st.success("Account created successfully. Please login.")
+
 def create_notification(
     session,
     message,
@@ -220,6 +263,10 @@ Base.metadata.create_all(bind=engine)
 # =========================================================
 
 with st.sidebar:
+    render_signup_section()
+
+    st.divider()
+
     st.header("⚙️ Workspace")
 
     try:
