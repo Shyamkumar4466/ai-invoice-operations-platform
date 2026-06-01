@@ -13,7 +13,7 @@ import time
 from google import genai
 from pydantic import BaseModel
 from sklearn.ensemble import IsolationForest
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, Boolean, ForeignKey, inspect, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, Boolean, ForeignKey, false, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from datetime import datetime
@@ -80,6 +80,9 @@ class Organization(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     users = relationship("User", back_populates="organization")
+    invoices = relationship("InvoiceRecord", back_populates="organization")
+    audit_logs = relationship("AuditLog", back_populates="organization")
+    notifications = relationship("NotificationRecord", back_populates="organization")
 
 class InvoiceRecord(Base):
     __tablename__ = "invoice_records"
@@ -88,6 +91,12 @@ class InvoiceRecord(Base):
     user_id = Column(
         Integer,
         ForeignKey("users.id"),
+        nullable=True,
+        index=True
+    )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id"),
         nullable=True,
         index=True
     )
@@ -115,6 +124,7 @@ class InvoiceRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("User", back_populates="invoices")
+    organization = relationship("Organization", back_populates="invoices")
 
 class User(Base):
     __tablename__ = "users"
@@ -147,6 +157,12 @@ class AuditLog(Base):
         nullable=True,
         index=True
     )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id"),
+        nullable=True,
+        index=True
+    )
 
     action = Column(String)
     invoice_number = Column(String)
@@ -160,6 +176,8 @@ class AuditLog(Base):
         default=datetime.utcnow
     )
 
+    organization = relationship("Organization", back_populates="audit_logs")
+
 class NotificationRecord(Base):
     __tablename__ = "notifications"
 
@@ -167,6 +185,12 @@ class NotificationRecord(Base):
     user_id = Column(
         Integer,
         ForeignKey("users.id"),
+        nullable=True,
+        index=True
+    )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id"),
         nullable=True,
         index=True
     )
@@ -180,6 +204,8 @@ class NotificationRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     is_read = Column(Boolean, default=False)
+
+    organization = relationship("Organization", back_populates="notifications")
 
 _BCRYPT_HASH_PATTERN = re.compile(
     r"\A\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}\Z"
@@ -253,6 +279,7 @@ def initialize_auth_session():
     auth_defaults = {
         "authenticated": False,
         "user_id": None,
+        "organization_id": None,
         "user_email": None,
         "user_name": None
     }
@@ -264,8 +291,11 @@ def initialize_auth_session():
 def logout_user():
     st.session_state.authenticated = False
     st.session_state.user_id = None
+    st.session_state.organization_id = None
     st.session_state.user_email = None
     st.session_state.user_name = None
+    st.session_state.pop("fraud_history", None)
+    st.session_state.pop("historical_totals", None)
 
 def render_login_section():
     st.subheader("Login")
@@ -286,6 +316,7 @@ def render_login_section():
 
     st.session_state.authenticated = True
     st.session_state.user_id = user.id
+    st.session_state.organization_id = user.organization_id
     st.session_state.user_email = user.email
     st.session_state.user_name = user.name
 
@@ -346,13 +377,15 @@ def create_notification(
     message,
     notification_type,
     invoice_filename,
-    user_id
+    user_id,
+    organization_id
 ):
     notification = NotificationRecord(
         message=message,
         notification_type=notification_type,
         invoice_filename=invoice_filename,
-        user_id=user_id
+        user_id=user_id,
+        organization_id=organization_id
     )
 
     session.add(notification)
@@ -390,18 +423,18 @@ for owner_scoped_table in (
 ):
     add_nullable_user_id_column(owner_scoped_table)
 
-def add_nullable_organization_id_column():
+def add_nullable_organization_id_column(table_name):
     database_inspector = inspect(engine)
     column_names = {
         column["name"]
-        for column in database_inspector.get_columns("users")
+        for column in database_inspector.get_columns(table_name)
     }
 
     if "organization_id" not in column_names:
         with engine.begin() as connection:
             connection.execute(
                 text(
-                    "ALTER TABLE users "
+                    f"ALTER TABLE {table_name} "
                     "ADD COLUMN organization_id INTEGER "
                     "REFERENCES organizations(id)"
                 )
@@ -410,14 +443,95 @@ def add_nullable_organization_id_column():
     with engine.begin() as connection:
         connection.execute(
             text(
-                "CREATE INDEX IF NOT EXISTS ix_users_organization_id "
-                "ON users (organization_id)"
+                f"CREATE INDEX IF NOT EXISTS ix_{table_name}_organization_id "
+                f"ON {table_name} (organization_id)"
             )
         )
 
-add_nullable_organization_id_column()
+for organization_scoped_table in (
+    "users",
+    "invoice_records",
+    "audit_logs",
+    "notifications"
+):
+    add_nullable_organization_id_column(organization_scoped_table)
+
+def migrate_legacy_organization_ownership():
+    session = SessionLocal()
+
+    try:
+        legacy_users = (
+            session.query(User)
+            .filter(User.organization_id.is_(None))
+            .all()
+        )
+
+        for user in legacy_users:
+            organization = Organization(
+                name=f"{user.name}'s Organization"
+            )
+            session.add(organization)
+            session.flush()
+            user.organization_id = organization.id
+
+        session.commit()
+
+    except Exception:
+        session.rollback()
+        raise
+
+    finally:
+        session.close()
+
+    with engine.begin() as connection:
+        for organization_scoped_table in (
+            "invoice_records",
+            "audit_logs",
+            "notifications"
+        ):
+            connection.execute(
+                text(
+                    f"UPDATE {organization_scoped_table} "
+                    "SET organization_id = ("
+                    "SELECT users.organization_id "
+                    "FROM users "
+                    f"WHERE users.id = {organization_scoped_table}.user_id"
+                    ") "
+                    "WHERE organization_id IS NULL "
+                    "AND user_id IS NOT NULL"
+                )
+            )
+
+def synchronize_authenticated_organization():
+    if not st.session_state.authenticated:
+        return
+
+    session = SessionLocal()
+
+    try:
+        user = session.get(User, st.session_state.user_id)
+
+        if not user or user.organization_id is None:
+            logout_user()
+            return
+
+        st.session_state.organization_id = user.organization_id
+
+    finally:
+        session.close()
+
+def current_organization_scope(model):
+    organization_id = st.session_state.organization_id
+
+    if organization_id is None:
+        return false()
+
+    return model.organization_id == organization_id
+
+migrate_legacy_organization_ownership()
 
 initialize_auth_session()
+synchronize_authenticated_organization()
 
 if not st.session_state.authenticated:
     render_authentication_screen()
@@ -976,7 +1090,7 @@ session = SessionLocal()
 unread_count = (
     session.query(NotificationRecord)
     .filter(
-        NotificationRecord.user_id == st.session_state.user_id,
+        current_organization_scope(NotificationRecord),
         NotificationRecord.is_read == False
     )
     .count()
@@ -1063,8 +1177,9 @@ with tab1:
                                         InvoiceRecord
                                     )
                                     .filter(
-                                        InvoiceRecord.user_id
-                                        == st.session_state.user_id
+                                        current_organization_scope(
+                                            InvoiceRecord
+                                        )
                                     )
                                     .all()
                                 ]
@@ -1082,7 +1197,8 @@ with tab1:
                                         f"High risk invoice detected: {data['invoice_number']}",
                                         "HIGH_RISK",
                                         file.name,
-                                        st.session_state.user_id
+                                        st.session_state.user_id,
+                                        st.session_state.organization_id
                                     )
 
                                 st.session_state[
@@ -1108,7 +1224,8 @@ with tab1:
                                     compliance_status=compliance_status,
                                     approval_status="Pending Review",
                                     risks=", ".join(risks),
-                                    user_id=st.session_state.user_id
+                                    user_id=st.session_state.user_id,
+                                    organization_id=st.session_state.organization_id
                                 )
 
                                 session.add(record)
@@ -1117,14 +1234,16 @@ with tab1:
                                     f"Invoice processed: {data['invoice_number']}",
                                     "PROCESSING",
                                     file.name,
-                                    st.session_state.user_id
+                                    st.session_state.user_id,
+                                    st.session_state.organization_id
                                 )
                                 audit = AuditLog(
                                     action="Invoice Processed",
                                     invoice_number=data["invoice_number"],
                                     vendor_name=data["vendor_name"],
                                     status=status,
-                                    user_id=st.session_state.user_id
+                                    user_id=st.session_state.user_id,
+                                    organization_id=st.session_state.organization_id
                                 )
 
                                 session.add(audit)
@@ -1268,8 +1387,7 @@ with tab2:
     rows = session.query(
         InvoiceRecord
     ).filter(
-        InvoiceRecord.user_id
-        == st.session_state.user_id
+        current_organization_scope(InvoiceRecord)
     ).all()
 
     analytics_records = []
@@ -1338,8 +1456,7 @@ with tab3:
     rows = session.query(
         InvoiceRecord
     ).filter(
-        InvoiceRecord.user_id
-        == st.session_state.user_id
+        current_organization_scope(InvoiceRecord)
     ).all()
 
     database_records = []
@@ -1416,8 +1533,9 @@ with tab3:
                         .filter(
                             InvoiceRecord.invoice_number
                             == selected_invoice_number,
-                            InvoiceRecord.user_id
-                            == st.session_state.user_id
+                            current_organization_scope(
+                                InvoiceRecord
+                            )
                         )
                         .first()
                     )
@@ -1431,7 +1549,8 @@ with tab3:
                             f"Invoice approved: {invoice_record.invoice_number}",
                             "APPROVAL",
                             invoice_record.filename,
-                            st.session_state.user_id
+                            st.session_state.user_id,
+                            st.session_state.organization_id
                         )
 
                         audit_entry = AuditLog(
@@ -1439,7 +1558,8 @@ with tab3:
                             invoice_number=invoice_record.invoice_number,
                             vendor_name=invoice_record.vendor_name,
                             status="Approved",
-                            user_id=st.session_state.user_id
+                            user_id=st.session_state.user_id,
+                            organization_id=st.session_state.organization_id
                         )
 
                         session.add(
@@ -1469,8 +1589,9 @@ with tab3:
                         .filter(
                             InvoiceRecord.invoice_number
                             == selected_invoice_number,
-                            InvoiceRecord.user_id
-                            == st.session_state.user_id
+                            current_organization_scope(
+                                InvoiceRecord
+                            )
                         )
                         .first()
                     )
@@ -1483,14 +1604,16 @@ with tab3:
                             f"Invoice rejected: {invoice_record.invoice_number}",
                             "REJECTION",
                             invoice_record.filename,
-                            st.session_state.user_id
+                            st.session_state.user_id,
+                            st.session_state.organization_id
                         )
                         audit_entry = AuditLog(
                             action="Invoice Rejected",
                             invoice_number=invoice_record.invoice_number,
                             vendor_name=invoice_record.vendor_name,
                             status="Rejected",
-                            user_id=st.session_state.user_id
+                            user_id=st.session_state.user_id,
+                            organization_id=st.session_state.organization_id
                         )
 
                         session.add(
@@ -1554,8 +1677,7 @@ with tab4:
         audit_records = (
             session.query(AuditLog)
             .filter(
-                AuditLog.user_id
-                == st.session_state.user_id
+                current_organization_scope(AuditLog)
             )
             .order_by(AuditLog.timestamp.desc())
             .all()
@@ -1644,8 +1766,7 @@ with tab5:
         session.query(
             NotificationRecord
         ).filter(
-            NotificationRecord.user_id
-            == st.session_state.user_id
+            current_organization_scope(NotificationRecord)
         ).update(
             {
                 NotificationRecord.is_read: True
@@ -1663,8 +1784,7 @@ with tab5:
     notifications = (
         session.query(NotificationRecord)
         .filter(
-            NotificationRecord.user_id
-            == st.session_state.user_id
+            current_organization_scope(NotificationRecord)
         )
         .order_by(
             NotificationRecord.created_at.desc()
