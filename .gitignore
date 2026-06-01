@@ -5,3 +5,13 @@ uploads/
 logs/
 invoice_platform.db
 .streamlit/
+# Virtual environments
+venv/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/

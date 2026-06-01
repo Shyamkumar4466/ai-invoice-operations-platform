@@ -12,7 +12,7 @@ import time
 from google import genai
 from pydantic import BaseModel
 from sklearn.ensemble import IsolationForest
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
@@ -85,12 +85,60 @@ class InvoiceRecord(Base):
 
     confidence = Column(Float)
     fraud_score = Column(Float)
+    compliance_score = Column(Float)
 
     status = Column(String)
     compliance_status = Column(String)
+    approval_status = Column(String)
     risks = Column(Text)
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True)
+
+    action = Column(String)
+    invoice_number = Column(String)
+
+    vendor_name = Column(String)
+
+    status = Column(String)
+
+    timestamp = Column(
+        DateTime,
+        default=datetime.utcnow
+    )
+
+class NotificationRecord(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True)
+
+    message = Column(String)
+
+    notification_type = Column(String)
+
+    invoice_filename = Column(String)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    is_read = Column(Boolean, default=False)
+
+def create_notification(
+    session,
+    message,
+    notification_type,
+    invoice_filename
+):
+    notification = NotificationRecord(
+        message=message,
+        notification_type=notification_type,
+        invoice_filename=invoice_filename
+    )
+
+    session.add(notification)
 
 Base.metadata.create_all(bind=engine)
 
@@ -123,6 +171,19 @@ with st.sidebar:
             "Enterprise (Unlimited)"
         ]
     )
+
+    st.divider()
+
+    user_role = st.selectbox(
+        "User Role",
+        [
+            "Analyst",
+            "Manager",
+            "Auditor",
+            "Admin"
+        ]
+    )
+
 
     if user_tier == "Free (10 Files)":
         upload_limit = 10
@@ -338,6 +399,67 @@ BLACKLISTED_VENDORS = [
     "Shell Company Ltd",
     "Unknown Vendor"
 ]
+CURRENCY_METADATA = {
+
+    "INR": {
+        "country": "India",
+        "tax_system": "GST",
+        "standard_tax_rate": 18
+    },
+
+    "USD": {
+        "country": "United States",
+        "tax_system": "Sales Tax",
+        "standard_tax_rate": 8
+    },
+
+    "GBP": {
+        "country": "United Kingdom",
+        "tax_system": "VAT",
+        "standard_tax_rate": 20
+    },
+
+    "EUR": {
+        "country": "European Union",
+        "tax_system": "VAT",
+        "standard_tax_rate": 20
+    },
+
+    "AED": {
+        "country": "United Arab Emirates",
+        "tax_system": "VAT",
+        "standard_tax_rate": 5
+    },
+
+    "AUD": {
+        "country": "Australia",
+        "tax_system": "GST",
+        "standard_tax_rate": 10
+    },
+
+    "SGD": {
+        "country": "Singapore",
+        "tax_system": "GST",
+        "standard_tax_rate": 9
+    },
+
+    "CAD": {
+        "country": "Canada",
+        "tax_system": "GST/HST",
+        "standard_tax_rate": 13
+    }
+}
+
+SUPPORTED_CURRENCIES = [
+    "INR",
+    "USD",
+    "GBP",
+    "EUR",
+    "AED",
+    "AUD",
+    "SGD",
+    "CAD"
+]
 
 class FraudDetector:
     def __init__(self):
@@ -376,6 +498,36 @@ def run_compliance_audit(
     existing_invoice_numbers
 ):
     flags = []
+
+    currency = data.get("currency", "")
+
+    currency_info = CURRENCY_METADATA.get(
+        currency,
+        {
+            "country": "Unknown",
+            "tax_system": "Unknown"
+        }
+    )
+
+    country = currency_info["country"]
+    tax_system = currency_info["tax_system"]
+
+    standard_tax_rate = currency_info.get(
+        "standard_tax_rate",
+        None
+    )
+
+    if not currency:
+
+        flags.append(
+            "Currency not detected"
+        )
+
+    elif currency not in SUPPORTED_CURRENCIES:
+
+        flags.append(
+            f"Unsupported currency ({currency})"
+        )
 
     # DUPLICATE CHECK
     invoice_id = (
@@ -418,20 +570,41 @@ def run_compliance_audit(
         flags.append(
             "Duplicate invoice number detected"
         )      
-    # GLOBAL TAX VALIDATION
+   # GLOBAL TAX VALIDATION
 
-    if data["subtotal"] > 0 and data["vat_or_tax_amount"] > 0:
+    actual_tax_rate = None
 
-        calculated_rate = (
+    if (
+        data["subtotal"] > 0 and
+        data["vat_or_tax_amount"] > 0
+    ):
+
+        actual_tax_rate = (
             data["vat_or_tax_amount"] /
             data["subtotal"]
         ) * 100
 
-        if calculated_rate > 35:
+        if actual_tax_rate > 35:
 
             flags.append(
-                f"Unusually high tax rate ({round(calculated_rate, 2)}%)"
+                f"Unusually high tax rate ({round(actual_tax_rate, 2)}%)"
             )
+
+    if (
+        actual_tax_rate is not None and
+        standard_tax_rate is not None
+    ):
+
+        difference = abs(
+            actual_tax_rate -
+            standard_tax_rate
+        )
+
+        if difference > 20:
+
+            flags.append(
+                f"Tax rate unusually different from typical {tax_system} rate"
+            )        
 
     # BLACKLIST CHECK
     if any(
@@ -449,7 +622,23 @@ def run_compliance_audit(
         )
 
     # ML ANOMALY DETECTION
+
     detector = FraudDetector()
+    compliance_score = 100
+    compliance_score -= len(flags) * 10
+
+    if compliance_score < 0:
+        compliance_score = 0
+
+    if compliance_score >= 90:
+        compliance_status = "Compliant"
+
+    elif compliance_score >= 70:
+        compliance_status = "Review Required"
+
+    else:
+        compliance_status = "High Risk"
+
 
     fraud_score = min(
         len(flags) * 0.25,
@@ -462,13 +651,24 @@ def run_compliance_audit(
         )
 
     status = "✅ Verified"
-    compliance_status = "Compliant"
+
+    if compliance_score >= 90:
+        compliance_status = "Compliant"
+    elif compliance_score >= 70:
+        compliance_status = "Review Required"
+    else:
+        compliance_status = "High Risk"
 
     if flags:
         status = "⚠️ Flagged"
-        compliance_status = "Non-Compliant"
-    return status, compliance_status, flags, fraud_score
 
+    return (
+        status,
+        compliance_status,
+        flags,
+        fraud_score,
+        compliance_score
+    )
 # =========================================================
 # SESSION STATE
 # =========================================================
@@ -482,11 +682,22 @@ if "historical_totals" not in st.session_state:
 # =========================================================
 # TABS
 # =========================================================
+session = SessionLocal()
 
-tab1, tab2, tab3 = st.tabs([
+unread_count = (
+    session.query(NotificationRecord)
+    .filter(
+        NotificationRecord.is_read == False
+    )
+    .count()
+)
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📤 Invoice Processing & Compliance",
     "📊 Analytics Dashboard",
-    "🗄️ Invoice Database"
+    "🗄️ Invoice Database",
+    "⚖️ Audit Trail",
+    f"📢 Notifications ({unread_count})"
 ])
 
 # =========================================================
@@ -546,7 +757,13 @@ with tab1:
                                     )
 
                                 except Exception as e:
-                                    st.error(f"AI extraction failed: {e}")
+
+                                    logging.error(str(e))
+
+                                    st.error(
+                                        "AI service temporarily unavailable. Please try again later."
+                                    )
+
                                     continue
 
                                 # AUDIT ENGINE
@@ -556,12 +773,21 @@ with tab1:
                                         InvoiceRecord
                                     ).all()
                                 ]
-                                status, compliance_status, risks, fraud_score = run_compliance_audit(
+                                status, compliance_status, risks, fraud_score, compliance_score = run_compliance_audit(
                                     data,
                                     st.session_state["fraud_history"],
                                     st.session_state["historical_totals"],
                                     existing_invoice_numbers
                                 )
+
+                                if compliance_status == "High Risk":
+
+                                    create_notification(
+                                        session,
+                                        f"High risk invoice detected: {data['invoice_number']}",
+                                        "HIGH_RISK",
+                                        file.name
+                                    )
 
                                 st.session_state[
                                     "historical_totals"
@@ -581,12 +807,28 @@ with tab1:
                                     total=data["total_amount"],
                                     confidence=data["confidence_score"],
                                     fraud_score=fraud_score,
+                                    compliance_score=compliance_score,
                                     status=status,
                                     compliance_status=compliance_status,
+                                    approval_status="Pending Review",
                                     risks=", ".join(risks)
                                 )
 
                                 session.add(record)
+                                create_notification(
+                                    session,
+                                    f"Invoice processed: {data['invoice_number']}",
+                                    "PROCESSING",
+                                    file.name
+                                )
+                                audit = AuditLog(
+                                    action="Invoice Processed",
+                                    invoice_number=data["invoice_number"],
+                                    vendor_name=data["vendor_name"],
+                                    status=status
+                                )
+
+                                session.add(audit)
                                 session.commit()
 
                                 # UI DATA
@@ -597,8 +839,10 @@ with tab1:
                                     "Currency": data["currency"],
                                     "Total": data["total_amount"],
                                     "Fraud Score": round(fraud_score, 2),
+                                    "Compliance Score": round(compliance_score, 2),
                                     "Confidence": f"{data['confidence_score']*100:.0f}%",
                                     "Status": status,
+                                    "Approval Status": "Pending Review",
                                     "Risks": ", ".join(risks)
                                 })
 
@@ -750,7 +994,6 @@ with tab2:
             gemini_model=None
         )
 
-        # BAR CHART
         fig = px.bar(
             analytics_df,
             x="vendor_name",
@@ -764,7 +1007,6 @@ with tab2:
             use_container_width=True
         )
 
-        # FRAUD HISTOGRAM
         fig2 = px.histogram(
             analytics_df,
             x="fraud_score",
@@ -776,6 +1018,7 @@ with tab2:
             fig2,
             use_container_width=True
         )
+
     else:
         st.info(
             "Upload invoices to start generating compliance analytics."
@@ -806,10 +1049,12 @@ with tab3:
             "Total": row.total,
             "Fraud Score": row.fraud_score,
             "Status": row.status,
+            "Approval Status": row.approval_status,
             "Risks": row.risks
         })
 
     if database_records:
+
         db_df = pd.DataFrame(
             database_records
         )
@@ -819,9 +1064,321 @@ with tab3:
             use_container_width=True
         )
 
+        st.divider()
+
+        st.subheader(
+            "📝 Invoice Approval Center"
+        )
+
+        pending_rows = [
+            r for r in rows
+            if r.approval_status == "Pending Review"
+        ]
+
+        if pending_rows:
+
+            invoice_options = [
+                f"{r.invoice_number} | {r.vendor_name}"
+                for r in pending_rows
+            ]
+
+            selected_invoice = st.selectbox(
+                "Select Invoice",
+                invoice_options
+            )
+
+            if user_role in ["Manager", "Admin"]:
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    approve_btn = st.button(
+                        "✅ Approve Invoice"
+                    )
+
+                with col2:
+                    reject_btn = st.button(
+                        "❌ Reject Invoice"
+                    )
+
+                if approve_btn:
+
+                    selected_invoice_number = (
+                        selected_invoice.split("|")[0].strip()
+                    )
+
+                    invoice_record = (
+                        session.query(InvoiceRecord)
+                        .filter(
+                            InvoiceRecord.invoice_number
+                            == selected_invoice_number
+                        )
+                        .first()
+                    )
+
+                    if invoice_record:
+
+                        invoice_record.approval_status = "Approved"
+
+                        create_notification(
+                            session,
+                            f"Invoice approved: {invoice_record.invoice_number}",
+                            "APPROVAL",
+                            invoice_record.filename
+                        )
+
+                        audit_entry = AuditLog(
+                            action="Invoice Approved",
+                            invoice_number=invoice_record.invoice_number,
+                            vendor_name=invoice_record.vendor_name,
+                            status="Approved"
+                        )
+
+                        session.add(
+                            audit_entry
+                        )
+
+                        session.commit()
+
+                        st.success(
+                            "Invoice approved successfully."
+                        )
+
+                        st.rerun()
+
+                    else:
+                        st.error(
+                            "Selected invoice not found."
+                        )
+
+                if reject_btn:
+
+                    selected_invoice_number = (
+                        selected_invoice.split("|")[0].strip()
+                    )
+                    invoice_record = (
+                        session.query(InvoiceRecord)
+                        .filter(
+                            InvoiceRecord.invoice_number
+                            == selected_invoice_number
+                        )
+                        .first()
+                    )
+
+                    if invoice_record:
+                        invoice_record.approval_status = "Rejected"
+
+                        create_notification(
+                            session,
+                            f"Invoice rejected: {invoice_record.invoice_number}",
+                            "REJECTION",
+                            invoice_record.filename
+                        )
+                        audit_entry = AuditLog(
+                            action="Invoice Rejected",
+                            invoice_number=invoice_record.invoice_number,
+                            vendor_name=invoice_record.vendor_name,
+                            status="Rejected"
+                        )
+
+                        session.add(
+                            audit_entry
+                        )
+
+                        session.commit()
+
+                        st.success(
+                            "Invoice rejected successfully."
+                        )
+
+                        st.rerun()
+
+                    else:
+                        st.error(
+                            "Selected invoice not found."
+                        )
+
+            else:
+                st.warning(
+                    "Only Managers and Admins can approve invoices."
+                )
+
+        else:
+            st.success(
+                "No invoices pending review."
+            )
     else:
+
         st.info(
             "No invoices stored yet."
+        )
+# =========================================================
+# TAB 4
+# =========================================================
+
+with tab4:
+
+    if user_role not in ["Manager", "Auditor", "Admin"]:
+
+        st.warning(
+            "Audit Trail access is restricted to Managers, Auditors and Admins."
+        )
+
+    else:
+
+        st.subheader("📜 Audit Trail")
+
+        audit_status_filter = st.selectbox(
+            "Filter by Status",
+            ["All", "Verified", "Flagged"]
+        )
+
+        audit_search = st.text_input(
+            "Search Invoice Number or Vendor"
+        )
+
+        session = SessionLocal()
+
+        audit_records = (
+            session.query(AuditLog)
+            .order_by(AuditLog.timestamp.desc())
+            .all()
+        )
+
+        if audit_records:
+
+            audit_df = pd.DataFrame([
+                {
+                    "Action": r.action,
+                    "Invoice #": r.invoice_number,
+                    "Vendor": r.vendor_name,
+                    "Status": r.status,
+                    "Timestamp": r.timestamp
+                }
+                for r in audit_records
+            ])
+
+            filtered_audit_df = audit_df.copy()
+
+            if audit_status_filter != "All":
+
+                filtered_audit_df = filtered_audit_df[
+                    filtered_audit_df["Status"].str.contains(
+                        audit_status_filter,
+                        case=False,
+                        na=False
+                    )
+                ]
+
+            if audit_search:
+
+                filtered_audit_df = filtered_audit_df[
+                    filtered_audit_df["Invoice #"]
+                    .astype(str)
+                    .str.contains(
+                        audit_search,
+                        case=False,
+                        na=False
+                    )
+                    |
+                    filtered_audit_df["Vendor"]
+                    .astype(str)
+                    .str.contains(
+                        audit_search,
+                        case=False,
+                        na=False
+                    )
+                ]
+
+            st.dataframe(
+                filtered_audit_df,
+                use_container_width=True
+            )
+
+        else:
+
+            st.info(
+                "No audit records available."
+            )
+
+# =========================================================
+# TAB 5
+# =========================================================
+
+with tab5:
+
+    st.subheader("📢 Notification Center")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        mark_all_read = st.button(
+            "✅ Mark All Read"
+        )
+
+    with col2:
+        refresh_notifications = st.button(
+            "🔄 Refresh"
+        )
+
+    session = SessionLocal()
+
+    if mark_all_read:
+
+        session.query(
+            NotificationRecord
+        ).update(
+            {
+                NotificationRecord.is_read: True
+            }
+        )
+
+        session.commit()
+
+        st.success(
+            "All notifications marked as read."
+        )
+
+        st.rerun()
+
+    notifications = (
+        session.query(NotificationRecord)
+        .order_by(
+            NotificationRecord.created_at.desc()
+        )
+        .all()
+    )
+
+    if notifications:
+
+        notification_data = []
+
+        for n in notifications:
+
+            notification_data.append({
+                "Type": n.notification_type,
+                "Message": n.message,
+                "Invoice": n.invoice_filename,
+                "Created": n.created_at,
+                "Status": (
+                    "🔵 Unread"
+                    if not n.is_read
+                    else "✅ Read"
+                )
+            })
+
+        notification_df = pd.DataFrame(
+            notification_data
+        )
+
+        st.dataframe(
+            notification_df,
+            use_container_width=True
+        )
+
+    else:
+
+        st.info(
+            "No notifications available."
         )
 
 # =========================================================

@@ -202,6 +202,27 @@ def normalize_invoice_dataframe(
     normalized["currency"] = _series_or_default(normalized, "currency", "UNKNOWN").fillna(
         "UNKNOWN"
     )
+    normalized["country"] = normalized["currency"].map({
+        "INR": "India",
+        "USD": "United States",
+        "GBP": "United Kingdom",
+        "EUR": "European Union",
+        "AED": "United Arab Emirates",
+        "AUD": "Australia",
+        "SGD": "Singapore",
+        "CAD": "Canada"
+    }).fillna("Unknown")
+
+    normalized["tax_system"] = normalized["currency"].map({
+        "INR": "GST",
+        "USD": "Sales Tax",
+        "GBP": "VAT",
+        "EUR": "VAT",
+        "AED": "VAT",
+        "AUD": "GST",
+        "SGD": "GST",
+        "CAD": "GST/HST"
+    }).fillna("Unknown")
     normalized["status"] = _series_or_default(normalized, "status", "Processed").fillna(
         "Processed"
     )
@@ -374,6 +395,14 @@ def render_dashboard_charts(df: pd.DataFrame) -> None:
         .agg(total_spend=("total_amount", "sum"), invoice_count=("invoice_id", "count"))
         .sort_values("total_spend", ascending=False)
     )
+    country_df = (
+        df.groupby("country", as_index=False)
+        .agg(
+            total_spend=("total_amount", "sum"),
+            invoice_count=("invoice_id", "count")
+        )
+        .sort_values("total_spend", ascending=False)
+    )
     risk_vendor_df = (
         df.groupby("vendor", as_index=False)
         .agg(
@@ -426,6 +455,21 @@ def render_dashboard_charts(df: pd.DataFrame) -> None:
             "Currency Distribution",
             _currency_distribution_chart(currency_df),
             "Spend exposure by invoice currency.",
+        )
+    left_col, right_col = st.columns([1, 1])
+
+    with left_col:
+        _render_chart_card(
+            "Country Distribution",
+            _country_distribution_chart(country_df),
+            "Invoice volume distribution by country."
+        )
+
+    with right_col:
+        _render_chart_card(
+            "Country Spend Analysis",
+            _country_spend_chart(country_df),
+            "Total spend distribution across countries."
         )
 
     _render_chart_card(
@@ -619,6 +663,41 @@ def _currency_distribution_chart(currency_df: pd.DataFrame) -> go.Figure:
     fig.update_traces(textposition="inside", textinfo="percent+label")
     return _style_figure(fig)
 
+def _country_distribution_chart(country_df: pd.DataFrame) -> go.Figure:
+
+    fig = px.pie(
+        country_df,
+        names="country",
+        values="invoice_count",
+        hole=0.58
+    )
+
+    fig.update_traces(
+        textposition="inside",
+        textinfo="percent+label"
+    )
+
+    return _style_figure(fig)
+
+def _country_spend_chart(country_df: pd.DataFrame) -> go.Figure:
+
+    fig = px.bar(
+        country_df,
+        x="country",
+        y="total_spend",
+        text="total_spend"
+    )
+
+    fig.update_traces(
+        textposition="outside"
+    )
+
+    fig.update_layout(
+        xaxis_title="Country",
+        yaxis_title="Total Spend"
+    )
+
+    return _style_figure(fig)
 
 def _high_risk_vendor_chart(risk_vendor_df: pd.DataFrame) -> go.Figure:
     if risk_vendor_df.empty:
