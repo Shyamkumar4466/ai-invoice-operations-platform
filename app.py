@@ -10,6 +10,7 @@ import logging
 import re
 import time
 
+from contextlib import nullcontext
 from google import genai
 from pydantic import BaseModel
 from sklearn.ensemble import IsolationForest
@@ -65,6 +66,8 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
 Base = declarative_base()
+
+DEFAULT_USER_ROLE = "Admin"
 
 # =========================================================
 # DATABASE MODEL
@@ -141,6 +144,12 @@ class User(Base):
     name = Column(String, nullable=False)
     email = Column(String, nullable=False, unique=True, index=True)
     password_hash = Column(String, nullable=False)
+    role = Column(
+        String,
+        nullable=False,
+        default=DEFAULT_USER_ROLE,
+        server_default=DEFAULT_USER_ROLE
+    )
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -237,6 +246,7 @@ def create_user(name, email, password_hash):
             name=normalized_name,
             email=email.strip().lower(),
             password_hash=password_hash,
+            role=DEFAULT_USER_ROLE,
             organization=organization
         )
 
@@ -281,7 +291,8 @@ def initialize_auth_session():
         "user_id": None,
         "organization_id": None,
         "user_email": None,
-        "user_name": None
+        "user_name": None,
+        "user_role": None
     }
 
     for key, default_value in auth_defaults.items():
@@ -294,6 +305,7 @@ def logout_user():
     st.session_state.organization_id = None
     st.session_state.user_email = None
     st.session_state.user_name = None
+    st.session_state.user_role = None
     st.session_state.pop("fraud_history", None)
     st.session_state.pop("historical_totals", None)
 
@@ -319,6 +331,7 @@ def render_login_section():
     st.session_state.organization_id = user.organization_id
     st.session_state.user_email = user.email
     st.session_state.user_name = user.name
+    st.session_state.user_role = user.role
 
     st.rerun()
 
@@ -391,6 +404,32 @@ def create_notification(
     session.add(notification)
 
 Base.metadata.create_all(bind=engine)
+
+def migrate_user_roles():
+    database_inspector = inspect(engine)
+    column_names = {
+        column["name"]
+        for column in database_inspector.get_columns("users")
+    }
+
+    if "role" not in column_names:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN role VARCHAR NOT NULL DEFAULT 'Admin'"
+                )
+            )
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE users "
+                "SET role = :default_role "
+                "WHERE role IS NULL OR TRIM(role) = ''"
+            ),
+            {"default_role": DEFAULT_USER_ROLE}
+        )
 
 def add_nullable_user_id_column(table_name):
     database_inspector = inspect(engine)
@@ -511,14 +550,30 @@ def synchronize_authenticated_organization():
     try:
         user = session.get(User, st.session_state.user_id)
 
-        if not user or user.organization_id is None:
+        if not user or user.organization_id is None or not user.role:
             logout_user()
             return
 
         st.session_state.organization_id = user.organization_id
+        st.session_state.user_role = user.role
 
     finally:
         session.close()
+
+def has_role(required_roles):
+    return st.session_state.user_role in required_roles
+
+def can_upload_invoice():
+    return has_role(["Admin", "Manager", "Analyst"])
+
+def can_approve_invoice():
+    return has_role(["Admin", "Manager"])
+
+def can_view_analytics():
+    return has_role(["Admin", "Manager", "Auditor"])
+
+def can_view_audit_logs():
+    return has_role(["Admin", "Manager", "Auditor"])
 
 def current_organization_scope(model):
     organization_id = st.session_state.organization_id
@@ -528,6 +583,7 @@ def current_organization_scope(model):
 
     return model.organization_id == organization_id
 
+migrate_user_roles()
 migrate_legacy_organization_ownership()
 
 initialize_auth_session()
@@ -542,7 +598,10 @@ if not st.session_state.authenticated:
 # =========================================================
 
 with st.sidebar:
-    st.write(f"Welcome, {st.session_state.user_name}")
+    st.write("Logged in as:")
+    st.write(st.session_state.user_name)
+    st.write("Role:")
+    st.write(st.session_state.user_role)
 
     if st.button("Logout"):
         logout_user()
@@ -574,19 +633,6 @@ with st.sidebar:
             "Enterprise (Unlimited)"
         ]
     )
-
-    st.divider()
-
-    user_role = st.selectbox(
-        "User Role",
-        [
-            "Analyst",
-            "Manager",
-            "Auditor",
-            "Admin"
-        ]
-    )
-
 
     if user_tier == "Free (10 Files)":
         upload_limit = 10
@@ -1096,13 +1142,26 @@ unread_count = (
     .count()
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+dashboard_tabs = [
     "📤 Invoice Processing & Compliance",
     "📊 Analytics Dashboard",
-    "🗄️ Invoice Database",
-    "⚖️ Audit Trail",
-    f"📢 Notifications ({unread_count})"
-])
+    "🗄️ Invoice Database"
+]
+
+if can_view_audit_logs():
+    dashboard_tabs.append("⚖️ Audit Trail")
+
+dashboard_tabs.append(f"📢 Notifications ({unread_count})")
+
+tab_sections = st.tabs(dashboard_tabs)
+tab1, tab2, tab3 = tab_sections[:3]
+
+if can_view_audit_logs():
+    tab4, tab5 = tab_sections[3:]
+
+else:
+    tab4 = nullcontext()
+    tab5 = tab_sections[3]
 
 # =========================================================
 # TAB 1
@@ -1111,17 +1170,25 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.subheader("📤 Upload Source Documents")
 
-    uploaded_files = st.file_uploader(
-        f"Supported: PDF, PNG, JPG, DOCX (Limit: {upload_limit})",
-        type=[
-            "pdf",
-            "docx",
-            "png",
-            "jpg",
-            "jpeg"
-        ],
-        accept_multiple_files=True
-    )
+    uploaded_files = None
+
+    if can_upload_invoice():
+        uploaded_files = st.file_uploader(
+            f"Supported: PDF, PNG, JPG, DOCX (Limit: {upload_limit})",
+            type=[
+                "pdf",
+                "docx",
+                "png",
+                "jpg",
+                "jpeg"
+            ],
+            accept_multiple_files=True
+        )
+
+    else:
+        st.warning(
+            "Invoice upload access is restricted to Admins, Managers and Analysts."
+        )
 
     if uploaded_files and gemini_api_key:
         if len(uploaded_files) > upload_limit:
@@ -1382,13 +1449,21 @@ with tab1:
 
 with tab2:
 
-    session = SessionLocal()
+    rows = []
 
-    rows = session.query(
-        InvoiceRecord
-    ).filter(
-        current_organization_scope(InvoiceRecord)
-    ).all()
+    if can_view_analytics():
+        session = SessionLocal()
+
+        rows = session.query(
+            InvoiceRecord
+        ).filter(
+            current_organization_scope(InvoiceRecord)
+        ).all()
+
+    else:
+        st.warning(
+            "Analytics access is restricted to Admins, Managers and Auditors."
+        )
 
     analytics_records = []
 
@@ -1439,7 +1514,7 @@ with tab2:
             use_container_width=True
         )
 
-    else:
+    elif can_view_analytics():
         st.info(
             "Upload invoices to start generating compliance analytics."
         )
@@ -1509,7 +1584,7 @@ with tab3:
                 invoice_options
             )
 
-            if user_role in ["Manager", "Admin"]:
+            if can_approve_invoice():
                 col1, col2 = st.columns(2)
 
                 with col1:
@@ -1653,13 +1728,7 @@ with tab3:
 
 with tab4:
 
-    if user_role not in ["Manager", "Auditor", "Admin"]:
-
-        st.warning(
-            "Audit Trail access is restricted to Managers, Auditors and Admins."
-        )
-
-    else:
+    if can_view_audit_logs():
 
         st.subheader("📜 Audit Trail")
 
